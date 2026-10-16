@@ -51,7 +51,21 @@ BANNED_USERS = {}
 MAINTENANCE = {"active": False,
                "reason": "Bot is under maintenance. Please try again later."}
 
+# ==================== DATABASE ====================
+db = giveaways = entries = votes = None
+sudo_col = users_col = settings_col = None
+
 async def init_db():
+    global db, giveaways, entries, votes, sudo_col, users_col, settings_col
+    mongo = AsyncIOMotorClient(MONGO_URI)
+    db = mongo["giveaway_bot"]
+    giveaways = db["giveaways"]
+    entries = db["entries"]
+    votes = db["votes"]
+    sudo_col = db["sudo_users"]
+    users_col = db["users"]
+    settings_col = db["settings"]
+
     global SUDO_USERS, MAINTENANCE
     await sudo_col.update_one({"user_id": OWNER_ID}, {"$set": {"user_id": OWNER_ID}}, upsert=True)
     docs = await sudo_col.find().to_list(1000)
@@ -892,4 +906,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(main())
