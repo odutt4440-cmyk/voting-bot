@@ -906,4 +906,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    aasyncio.run(main())
+    asyncio.run(main())
