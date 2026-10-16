@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton as _BaseIBtn, CallbackQuery, Message
 from pyrogram.enums import ButtonStyle, ChatMemberStatus
-from pyrogram.raw.types import UpdateChatMember, ChatMemberStatus as RawStatus
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
 
@@ -23,7 +22,7 @@ def InlineKeyboardButton(text, style=None, **kwargs):
     """Colored-button wrapper (kurigram ButtonStyle). Auto-picks color from label text."""
     if style is None:
         danger = ("❌", "🚫", "🗑", "delete", "terminate", "reject", "ban", "close",
-                  "remove", "cancel", "stop", "finish", "deduct", "−", "-")
+                  "remove", "cancel", "stop", "finish", "deduct", "−")
         success = ("✅", "🟢", "✨", "approve", "confirm", "verify", "add", "claim",
                    "join", "check", "+", "vote")
         t = text.lower()
@@ -48,8 +47,9 @@ temp_data = {}
 
 # ==================== SUDO / BAN / MAINTENANCE ====================
 SUDO_USERS = set()
-BANNED_USERS = {}      # {user_id: reason}
-MAINTENANCE = {"active": False, "reason": "Bot is under maintenance. Please try again later."}
+BANNED_USERS = {}
+MAINTENANCE = {"active": False,
+               "reason": "Bot is under maintenance. Please try again later."}
 
 async def init_db():
     global SUDO_USERS, MAINTENANCE
@@ -81,7 +81,7 @@ def banned_msg(reason):
             f"📝 **Reason:** {reason}\n\n"
             f"ℹ️ _Contact the bot owner if you believe this is a mistake._")
 
-async def gate(user_id: int) -> str | None:
+async def gate(user_id: int):
     """Return a block message if banned or maintenance, else None."""
     if user_id == OWNER_ID:
         return None
@@ -222,6 +222,22 @@ async def set_channel(_, m: Message):
         f"🏁 /end — finish and announce the winner")
 
 # ==================== PARTICIPANT FLOW ====================
+async def create_entry(g: dict, uid: int, name: str, gid: str):
+    """Insert entry + post vote box in the channel. Returns True on success."""
+    await entries.insert_one({"giveaway_id": gid, "user_id": uid,
+                              "name": name, "votes": 0})
+    try:
+        post = await app.send_message(
+            g["channel_id"], f"**{name}**",
+            reply_markup=vote_button(0, gid, uid))
+        await entries.update_one(
+            {"giveaway_id": gid, "user_id": uid},
+            {"$set": {"message_id": post.id, "chat_id": g["channel_id"]}})
+        return True
+    except Exception:
+        await entries.delete_one({"giveaway_id": gid, "user_id": uid})
+        return False
+
 async def handle_participant(m, gid: str):
     try:
         g = await giveaways.find_one({"_id": ObjectId(gid)})
@@ -246,17 +262,7 @@ async def handle_participant(m, gid: str):
             f"✅ **You are already participating!**\n🗳️ **Your votes:** {existing['votes']}")
 
     name = m.from_user.first_name or "Participant"
-    await entries.insert_one({"giveaway_id": gid, "user_id": uid,
-                              "name": name, "votes": 0})
-    try:
-        post = await app.send_message(
-            g["channel_id"], f"**{name}**",
-            reply_markup=vote_button(0, gid, uid))
-        await entries.update_one(
-            {"giveaway_id": gid, "user_id": uid},
-            {"$set": {"message_id": post.id, "chat_id": g["channel_id"]}})
-    except Exception:
-        await entries.delete_one({"giveaway_id": gid, "user_id": uid})
+    if not await create_entry(g, uid, name, gid):
         return await m.reply_text(
             "⚠️ **Bot cannot post in the channel.** "
             "Ask the channel owner to make the bot an Admin.")
@@ -273,17 +279,8 @@ async def check_join(_, q: CallbackQuery):
     if await entries.find_one({"giveaway_id": gid, "user_id": uid}):
         return
     name = q.from_user.first_name or "Participant"
-    await entries.insert_one({"giveaway_id": gid, "user_id": uid,
-                              "name": name, "votes": 0})
-    try:
-        post = await app.send_message(g["channel_id"], f"**{name}**",
-                                      reply_markup=vote_button(0, gid, uid))
-        await entries.update_one(
-            {"giveaway_id": gid, "user_id": uid},
-            {"$set": {"message_id": post.id, "chat_id": g["channel_id"]}})
+    if await create_entry(g, uid, name, gid):
         await app.send_message(uid, "🎉 **You are participating!** Good luck! 🍀")
-    except Exception:
-        await entries.delete_one({"giveaway_id": gid, "user_id": uid})
 
 # ==================== PUBLIC VOTING ====================
 @app.on_callback_query(filters.regex(r"^gvote:(.+):(\d+)$"))
@@ -375,14 +372,13 @@ async def panel_user(_, q: CallbackQuery):
     if not e:
         return await q.answer("Participant not found.", show_alert=True)
     await q.message.edit_text(
-        f"👤 **{e['name']}**\n🗳️ **Current votes:** {e['votes']}\n\n"
-        "Select an action:",
+        f"👤 **{e['name']}**\n🗳️ **Current votes:** {e['votes']}\n\nSelect an action:",
         reply_markup=participant_kb(gid, uid))
     await q.answer()
 
 async def authorize(user_id: int, gid: str) -> bool:
     g = await giveaways.find_one({"_id": ObjectId(gid)})
-    return g and (user_id == g["creator_id"] or user_id == OWNER_ID)
+    return bool(g) and (user_id == g["creator_id"] or user_id == OWNER_ID)
 
 @app.on_callback_query(filters.regex(r"^gadj:(.+):(\d+):(-?\d+)$"))
 async def adjust_votes(_, q: CallbackQuery):
@@ -398,9 +394,12 @@ async def adjust_votes(_, q: CallbackQuery):
                              {"$set": {"votes": new_v}})
     await refresh_vote_button(gid, uid)
     await q.answer(f"✅ Done! {e['name']} now has {new_v} votes.", show_alert=True)
-    await q.message.edit_text(
-        f"👤 **{e['name']}**\n🗳️ **Current votes:** {new_v}\n\nSelect an action:",
-        reply_markup=participant_kb(gid, uid))
+    try:
+        await q.message.edit_text(
+            f"👤 **{e['name']}**\n🗳️ **Current votes:** {new_v}\n\nSelect an action:",
+            reply_markup=participant_kb(gid, uid))
+    except Exception:
+        pass
 
 @app.on_callback_query(filters.regex(r"^gcust:(.+):(\d+)$"))
 async def custom_votes(_, q: CallbackQuery):
@@ -466,10 +465,10 @@ async def remove_one_participant(_, q: CallbackQuery):
     await q.answer(f"🗑 Removed {e['name']} and deleted their post.", show_alert=True)
     await open_panel(q.message.chat.id, gid, q.message.id)
 
-# ==================== TEXT INPUT ROUTER ====================
+# ==================== TEXT INPUT ROUTER (single handler — no conflicts) ====================
 @app.on_message(filters.private & filters.text &
-                ~filters.command(["start", "manage", "stats", "end", "panel", "addadmin",
-                                  "maintenance", "gban", "gunban"]))
+                ~filters.command(["start", "manage", "stats", "end", "panel",
+                                  "gban", "gunban"]))
 async def text_router(_, m: Message):
     state = user_states.get(m.from_user.id)
     if not state:
@@ -501,7 +500,7 @@ async def text_router(_, m: Message):
         user_states.pop(m.from_user.id, None)
         gid = d.get("gid")
         parts = m.text.strip().split(maxsplit=1)
-        if len(parts) < 2 or not parts[0].isdigit():
+        if len(parts) < 2 or not parts[0].lstrip("-").isdigit():
             return await m.reply_text("❌ **Wrong format!** Use: `UserID Name`")
         uid, name = int(parts[0]), parts[1]
         if not await authorize(m.from_user.id, gid):
@@ -509,17 +508,12 @@ async def text_router(_, m: Message):
         if await entries.find_one({"giveaway_id": gid, "user_id": uid}):
             return await m.reply_text("⚠️ **This participant already exists.**")
         g = await giveaways.find_one({"_id": ObjectId(gid)})
-        await entries.insert_one({"giveaway_id": gid, "user_id": uid,
-                                  "name": name, "votes": 0})
-        try:
-            post = await app.send_message(g["channel_id"], f"**{name}**",
-                                          reply_markup=vote_button(0, gid, uid))
-            await entries.update_one(
-                {"giveaway_id": gid, "user_id": uid},
-                {"$set": {"message_id": post.id, "chat_id": g["channel_id"]}})
-        except Exception:
-            pass
-        await m.reply_text(f"✅ **Added participant {name} with a vote box in the channel!**")
+        if await create_entry(g, uid, name, gid):
+            await m.reply_text(
+                f"✅ **Added participant {name} with a vote box in the channel!**")
+        else:
+            await m.reply_text("⚠️ **Bot cannot post in the channel.** "
+                               "Make sure the bot is an Admin there.")
 
     elif state == "OWN_ADD_SUDO":
         user_states.pop(m.from_user.id, None)
@@ -530,8 +524,35 @@ async def text_router(_, m: Message):
         if target == OWNER_ID:
             return await m.reply_text("⚠️ **The owner already has full powers.**")
         SUDO_USERS.add(target)
-        await sudo_col.update_one({"user_id": target}, {"$set": {"user_id": target}}, upsert=True)
+        await sudo_col.update_one({"user_id": target},
+                                  {"$set": {"user_id": target}}, upsert=True)
         await m.reply_text(f"✅ **Admin added!**\n👤 **User ID:** `{target}`",
+                           reply_markup=owner_panel_kb())
+
+    elif state == "OWN_BAN_ID":
+        try:
+            target = int(m.text.strip())
+        except ValueError:
+            return await m.reply_text("❌ **Send a numeric User ID only!**")
+        if target == OWNER_ID:
+            user_states.pop(m.from_user.id, None)
+            return await m.reply_text("⚠️ **You cannot ban yourself (owner)!**",
+                                      reply_markup=owner_panel_kb())
+        user_states[m.from_user.id] = "OWN_BAN_REASON"
+        temp_data[m.from_user.id] = {"ban_target": target}
+        await m.reply_text(
+            f"👤 **Target User ID:** `{target}`\n\n📝 **Send the ban reason:**",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="owner_panel")]]))
+
+    elif state == "OWN_UNBAN_ID":
+        user_states.pop(m.from_user.id, None)
+        try:
+            target = int(m.text.strip())
+        except ValueError:
+            return await m.reply_text("❌ **Send a numeric User ID only!**")
+        await unban_user(target)
+        await m.reply_text(f"🟢 **User `{target}` unbanned globally!**",
                            reply_markup=owner_panel_kb())
 
     elif state == "OWN_BAN_REASON":
@@ -539,10 +560,11 @@ async def text_router(_, m: Message):
         user_states.pop(m.from_user.id, None)
         if target is None:
             return await m.reply_text("❌ **Session expired.**")
-        await ban_user(target, m.text.strip() or "No reason provided")
+        reason = m.text.strip() or "No reason provided"
+        await ban_user(target, reason)
         await m.reply_text(
             f"🚫 **User banned globally!**\n\n👤 **User ID:** `{target}`\n"
-            f"📝 **Reason:** {m.text.strip() or 'No reason provided'}",
+            f"📝 **Reason:** {reason}",
             reply_markup=owner_panel_kb())
 
     elif state == "OWN_MAINT_REASON":
@@ -598,7 +620,8 @@ async def own_sudo(_, q: CallbackQuery):
     for uid in SUDO_USERS:
         if uid == OWNER_ID:
             continue
-        kb.append([InlineKeyboardButton(f"🗑 Remove {uid}", callback_data=f"own_sudo_rm:{uid}")])
+        kb.append([InlineKeyboardButton(f"🗑 Remove {uid}",
+                                        callback_data=f"own_sudo_rm:{uid}")])
     kb.append([InlineKeyboardButton("🔙 Back", callback_data="owner_panel")])
     await q.message.edit_text(
         f"👥 **MANAGE SUDO ADMINS**\n\n"
@@ -630,7 +653,8 @@ async def own_sudo_rm(_, q: CallbackQuery):
     for s in SUDO_USERS:
         if s == OWNER_ID:
             continue
-        kb.append([InlineKeyboardButton(f"🗑 Remove {s}", callback_data=f"own_sudo_rm:{s}")])
+        kb.append([InlineKeyboardButton(f"🗑 Remove {s}",
+                                        callback_data=f"own_sudo_rm:{s}")])
     kb.append([InlineKeyboardButton("🔙 Back", callback_data="owner_panel")])
     await q.message.edit_text("👥 **MANAGE SUDO ADMINS**",
                               reply_markup=InlineKeyboardMarkup(kb))
@@ -686,14 +710,17 @@ async def own_maint_toggle(_, q: CallbackQuery):
     state = "🔴 ON" if MAINTENANCE["active"] else "🟢 OFF"
     toggle = "🟢 Turn OFF Maintenance" if MAINTENANCE["active"] else "🔴 Turn ON Maintenance"
     await q.answer(f"✅ Maintenance is now {state}!", show_alert=True)
-    await q.message.edit_text(
-        f"🛠️ **MAINTENANCE MODE**\n\n"
-        f"📊 **Current status:** {state}\n"
-        f"📝 **Message:** {MAINTENANCE['reason']}",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(toggle, callback_data="own_maint_toggle")],
-            [InlineKeyboardButton("✏️ Change Maintenance Message", callback_data="own_maint_msg")],
-            [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
+    try:
+        await q.message.edit_text(
+            f"🛠️ **MAINTENANCE MODE**\n\n"
+            f"📊 **Current status:** {state}\n"
+            f"📝 **Message:** {MAINTENANCE['reason']}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(toggle, callback_data="own_maint_toggle")],
+                [InlineKeyboardButton("✏️ Change Maintenance Message", callback_data="own_maint_msg")],
+                [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
+    except Exception:
+        pass
 
 @app.on_callback_query(filters.regex("^own_maint_msg$"))
 async def own_maint_msg(_, q: CallbackQuery):
@@ -715,12 +742,13 @@ async def own_stats(_, q: CallbackQuery):
     active_gw = await giveaways.count_documents({"status": "active"})
     total_parts = await entries.count_documents({})
     total_votes = await votes.count_documents({})
+    total_users = await users_col.count_documents({})
     await q.message.edit_text(
         f"📊 **BOT STATISTICS**\n\n"
         f"🎁 **Total giveaways:** {total_gw} (Active: {active_gw})\n"
         f"👥 **Total participants:** {total_parts}\n"
         f"🗳️ **Total votes:** {total_votes}\n"
-        f"👤 **Total known users:** {await users_col.count_documents({})}\n"
+        f"👤 **Total known users:** {total_users}\n"
         f"🚫 **Banned users:** {len(BANNED_USERS)}\n"
         f"👥 **Sudo admins:** {len(SUDO_USERS) - 1}",
         reply_markup=InlineKeyboardMarkup([[
@@ -750,58 +778,55 @@ async def gunban_cmd(_, m: Message):
     await unban_user(int(parts[1]))
     await m.reply_text(f"🟢 **User `{parts[1]}` unbanned globally.**")
 
-# ==================== BAN/UNBAN ID INPUT STATES ====================
-@app.on_message(filters.private & filters.text & filters.command([]) is None if False else filters.private)
-async def catch_ids(_, m: Message):
-    """Handles OWN_BAN_ID / OWN_UNBAN_ID states for numeric input."""
-    state = user_states.get(m.from_user.id)
-    if state not in ("OWN_BAN_ID", "OWN_UNBAN_ID"):
-        return
-    if not m.text.lstrip("-").isdigit():
-        return await m.reply_text("❌ **Send a numeric User ID only!**")
-    target = int(m.text.strip())
-    if state == "OWN_UNBAN_ID":
-        user_states.pop(m.from_user.id, None)
-        await unban_user(target)
-        return await m.reply_text(f"🟢 **User `{target}` unbanned globally!**",
-                                  reply_markup=owner_panel_kb())
-    if target == OWNER_ID:
-        user_states.pop(m.from_user.id, None)
-        return await m.reply_text("⚠️ **You cannot ban yourself (owner)!**")
-    user_states[m.from_user.id] = "OWN_BAN_REASON"
-    temp_data[m.from_user.id] = {"ban_target": target}
-    await m.reply_text(f"👤 **Target User ID:** `{target}`\n\n📝 **Send the ban reason:**")
-
-# ==================== LEAVE DETECTION (auto vote removal) ====================
-def _raw_status(status):
-    if status is None:
-        return ChatMemberStatus.LEFT
-    if isinstance(status, RawStatus.Creator):
-        return ChatMemberStatus.OWNER
-    if isinstance(status, RawStatus.Admin):
-        return ChatMemberStatus.ADMINISTRATOR
-    if isinstance(status, RawStatus.Banned):
-        return ChatMemberStatus.BANNED
-    return ChatMemberStatus.LEFT
-
+# ==================== LEAVE DETECTION (version-safe, no raw imports) ====================
 IN_CHAT = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
 OUT_CHAT = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
 
+def _raw_status_name(status_obj):
+    """Map raw chat member status to ChatMemberStatus via class name —
+    works on any Kurigram/Pyrogram version without imports."""
+    if status_obj is None:
+        return ChatMemberStatus.LEFT
+    name = type(status_obj).__name__
+    if name == "ChatMemberStatusCreator":
+        return ChatMemberStatus.OWNER
+    if name == "ChatMemberStatusAdmin":
+        return ChatMemberStatus.ADMINISTRATOR
+    if name == "ChatMemberStatusBanned":
+        return ChatMemberStatus.BANNED
+    if name == "ChatMemberStatusRight":
+        return ChatMemberStatus.MEMBER
+    return ChatMemberStatus.LEFT  # Left / Empty / unknown
+
 @app.on_raw_update()
 async def on_raw_member_update(client, update, users, chats):
-    if not isinstance(update, UpdateChatMember):
+    # Version-safe: check by class name instead of importing UpdateChatMember
+    if type(update).__name__ != "UpdateChatMember":
         return
-    old_s = _raw_status(update.old_chat_member.status if getattr(update, "old_chat_member", None) else None)
-    new_s = _raw_status(update.new_chat_member.status if getattr(update, "new_chat_member", None) else None)
-    was_in = old_s in IN_CHAT
-    now_out = new_s in OUT_CHAT
-    if not (was_in and now_out):
+    old_member = getattr(update, "old_chat_member", None)
+    new_member = getattr(update, "new_chat_member", None)
+    old_s = _raw_status_name(old_member.status if old_member else None)
+    new_s = _raw_status_name(new_member.status if new_member else None)
+    if not (old_s in IN_CHAT and new_s in OUT_CHAT):
         return
-    user_id = update.from_id
-    chat_id = int("-100" + str(update.chat_id)) if update.chat_id < 0 else update.chat_id
+
+    # Who left — from_id is the affected user in chat member updates
+    user_id = getattr(update, "from_id", None)
+    if user_id is None and new_member and getattr(new_member, "user", None):
+        user_id = new_member.user.id
+    if user_id is None:
+        return
+
+    # Convert raw chat_id to a real channel id (-100xxxxxxxxxx)
+    raw_cid = getattr(update, "chat_id", None)
+    if raw_cid is None:
+        return
+    chat_id = int("-100" + str(abs(raw_cid))) if raw_cid < 0 else raw_cid
+
     async for g in giveaways.find({"channel_id": chat_id}):
         gid = str(g["_id"])
-        removed = await votes.find({"giveaway_id": gid, "voter_id": user_id}).to_list(None)
+        removed = await votes.find({"giveaway_id": gid,
+                                    "voter_id": user_id}).to_list(None)
         for rv in removed:
             await entries.find_one_and_update(
                 {"giveaway_id": gid, "user_id": rv["entry_user"]},
