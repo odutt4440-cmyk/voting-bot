@@ -1,13 +1,13 @@
-# pip install kurigram motor pymongo
+# pip install kurigram motor pymongo python-dotenv
 import asyncio
 import os
-import re
 from datetime import datetime
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton as _BaseIBtn, CallbackQuery, Message
 from pyrogram.enums import ButtonStyle, ChatMemberStatus
+from pyrogram.raw.types import UpdateChatMember, ChatMemberStatus as RawStatus
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
 
@@ -37,11 +37,61 @@ db = mongo["giveaway_bot"]
 giveaways = db["giveaways"]
 entries = db["entries"]
 votes = db["votes"]
+sudo_col = db["sudo_users"]
+users_col = db["users"]
+settings_col = db["settings"]
 
 app = Client("GiveawayBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-user_states = {}    # {user_id: state}
-temp_data = {}      # {user_id: {...}}
+user_states = {}
+temp_data = {}
+
+# ==================== SUDO / BAN / MAINTENANCE ====================
+SUDO_USERS = set()
+BANNED_USERS = {}      # {user_id: reason}
+MAINTENANCE = {"active": False, "reason": "Bot is under maintenance. Please try again later."}
+
+async def init_db():
+    global SUDO_USERS, MAINTENANCE
+    await sudo_col.update_one({"user_id": OWNER_ID}, {"$set": {"user_id": OWNER_ID}}, upsert=True)
+    docs = await sudo_col.find().to_list(1000)
+    SUDO_USERS = {d["user_id"] for d in docs}
+    SUDO_USERS.add(OWNER_ID)
+    for u in await users_col.find({"is_banned": True}).to_list(10000):
+        BANNED_USERS[u["user_id"]] = u.get("ban_reason", "")
+    m = await settings_col.find_one({"key": "maintenance"})
+    if m:
+        MAINTENANCE = {"active": m.get("is_active", False),
+                       "reason": m.get("reason", MAINTENANCE["reason"])}
+
+def is_sudo(uid): return uid in SUDO_USERS
+
+async def ban_user(uid, reason="No reason provided"):
+    BANNED_USERS[uid] = reason
+    await users_col.update_one({"user_id": uid},
+                               {"$set": {"is_banned": True, "ban_reason": reason}}, upsert=True)
+
+async def unban_user(uid):
+    BANNED_USERS.pop(uid, None)
+    await users_col.update_one({"user_id": uid},
+                               {"$set": {"is_banned": False, "ban_reason": ""}}, upsert=True)
+
+def banned_msg(reason):
+    return (f"🚫 **You are banned from using this bot.**\n\n"
+            f"📝 **Reason:** {reason}\n\n"
+            f"ℹ️ _Contact the bot owner if you believe this is a mistake._")
+
+async def gate(user_id: int) -> str | None:
+    """Return a block message if banned or maintenance, else None."""
+    if user_id == OWNER_ID:
+        return None
+    if user_id in BANNED_USERS:
+        return banned_msg(BANNED_USERS[user_id])
+    if MAINTENANCE["active"] and not is_sudo(user_id):
+        return (f"🚧 **SYSTEM MAINTENANCE MODE ACTIVE** 🚧\n\n"
+                f"📝 **Message:** {MAINTENANCE['reason']}\n\n"
+                f"ℹ️ _All bot operations are temporarily paused. Please try again later._")
+    return None
 
 # ==================== HELPERS ====================
 async def is_member(user_id: int, channel_id: int) -> bool:
@@ -69,17 +119,23 @@ async def refresh_vote_button(gid: str, uid: int):
         except Exception:
             pass
 
-def main_menu():
-    return InlineKeyboardMarkup([
+def main_menu(user_id: int):
+    rows = [
         [InlineKeyboardButton("🚀 Create Giveaway", callback_data="gw_create")],
-        [InlineKeyboardButton("❓ Help", callback_data="gw_help")]
-    ])
+        [InlineKeyboardButton("❓ Help", callback_data="gw_help")],
+    ]
+    if user_id == OWNER_ID:
+        rows.append([InlineKeyboardButton("⚙️ Admin Panel (Owner)",
+                                          callback_data="owner_panel")])
+    return InlineKeyboardMarkup(rows)
 
 # ==================== /START ====================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, m: Message):
+    block = await gate(m.from_user.id)
+    if block:
+        return await m.reply_text(block)
     args = m.text.split(maxsplit=1)
-    # Participation link: /start <giveaway_id>
     if len(args) == 2 and len(args[1]) == 24:
         return await handle_participant(m, args[1])
     await m.reply_text(
@@ -88,7 +144,7 @@ async def start_handler(_, m: Message):
         "• Participants must join your channel to enter and vote\n"
         "• Real votes only — leaving the channel removes votes\n\n"
         "Choose an option below:",
-        reply_markup=main_menu())
+        reply_markup=main_menu(m.from_user.id))
 
 @app.on_callback_query(filters.regex("^gw_help$"))
 async def help_cb(_, q: CallbackQuery):
@@ -106,6 +162,9 @@ async def help_cb(_, q: CallbackQuery):
 # ==================== CREATE GIVEAWAY ====================
 @app.on_callback_query(filters.regex("^gw_create$"))
 async def create_gw(_, q: CallbackQuery):
+    block = await gate(q.from_user.id)
+    if block:
+        return await q.answer(block, show_alert=True)
     active = await giveaways.find_one(
         {"creator_id": q.from_user.id, "status": {"$in": ["waiting_channel", "active"]}})
     if active:
@@ -160,7 +219,7 @@ async def set_channel(_, m: Message):
         f"`{link}`\n\n"
         f"⚙️ /manage — control panel\n"
         f"📊 /stats — live results\n"
-        f"🏁 /end — finish & announce winner")
+        f"🏁 /end — finish and announce the winner")
 
 # ==================== PARTICIPANT FLOW ====================
 async def handle_participant(m, gid: str):
@@ -210,10 +269,8 @@ async def check_join(_, q: CallbackQuery):
     if not g or not await is_member(q.from_user.id, g["channel_id"]):
         return await q.answer("❌ You have not joined the channel yet!", show_alert=True)
     await q.answer("✅ Verified!")
-    # simulate entry creation directly
     uid = q.from_user.id
-    existing = await entries.find_one({"giveaway_id": gid, "user_id": uid})
-    if existing:
+    if await entries.find_one({"giveaway_id": gid, "user_id": uid}):
         return
     name = q.from_user.first_name or "Participant"
     await entries.insert_one({"giveaway_id": gid, "user_id": uid,
@@ -282,6 +339,9 @@ async def open_panel(chat_id: int, gid: str, msg_id: int = None):
 
 @app.on_message(filters.command("manage") & filters.private)
 async def manage_cmd(_, m: Message):
+    block = await gate(m.from_user.id)
+    if block:
+        return await m.reply_text(block)
     g = await get_active_gw(m.from_user.id)
     if not g:
         return await m.reply_text("⛔ **No active giveaway found for you.**")
@@ -297,7 +357,17 @@ async def panel_close(_, q: CallbackQuery):
     await q.message.delete()
     await q.answer()
 
-# ---- Per-participant controls ----
+def participant_kb(gid: str, uid: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ +1 Vote", callback_data=f"gadj:{gid}:{uid}:1")],
+        [InlineKeyboardButton("➕ +5 Votes", callback_data=f"gadj:{gid}:{uid}:5")],
+        [InlineKeyboardButton("➕ +10 Votes", callback_data=f"gadj:{gid}:{uid}:10")],
+        [InlineKeyboardButton("➖ −1 Vote", callback_data=f"gadj:{gid}:{uid}:-1")],
+        [InlineKeyboardButton("➖ −5 Votes", callback_data=f"gadj:{gid}:{uid}:-5")],
+        [InlineKeyboardButton("🔢 Set Custom Votes", callback_data=f"gcust:{gid}:{uid}")],
+        [InlineKeyboardButton("🗑 Remove This Participant", callback_data=f"grm1:{gid}:{uid}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"gpanel:{gid}")]])
+
 @app.on_callback_query(filters.regex(r"^gp:(.+):(\d+)$"))
 async def panel_user(_, q: CallbackQuery):
     gid, uid = q.matches.group(1), int(q.matches.group(2))
@@ -307,15 +377,7 @@ async def panel_user(_, q: CallbackQuery):
     await q.message.edit_text(
         f"👤 **{e['name']}**\n🗳️ **Current votes:** {e['votes']}\n\n"
         "Select an action:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ +1 Vote", callback_data=f"gadj:{gid}:{uid}:1")],
-            [InlineKeyboardButton("➕ +5 Votes", callback_data=f"gadj:{gid}:{uid}:5")],
-            [InlineKeyboardButton("➕ +10 Votes", callback_data=f"gadj:{gid}:{uid}:10")],
-            [InlineKeyboardButton("➖ −1 Vote", callback_data=f"gadj:{gid}:{uid}:-1")],
-            [InlineKeyboardButton("➖ −5 Votes", callback_data=f"gadj:{gid}:{uid}:-5")],
-            [InlineKeyboardButton("🔢 Set Custom Votes", callback_data=f"gcust:{gid}:{uid}")],
-            [InlineKeyboardButton("🗑 Remove This Participant", callback_data=f"grm1:{gid}:{uid}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"gpanel:{gid}")]]))
+        reply_markup=participant_kb(gid, uid))
     await q.answer()
 
 async def authorize(user_id: int, gid: str) -> bool:
@@ -336,20 +398,10 @@ async def adjust_votes(_, q: CallbackQuery):
                              {"$set": {"votes": new_v}})
     await refresh_vote_button(gid, uid)
     await q.answer(f"✅ Done! {e['name']} now has {new_v} votes.", show_alert=True)
-    # refresh panel user view
     await q.message.edit_text(
         f"👤 **{e['name']}**\n🗳️ **Current votes:** {new_v}\n\nSelect an action:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ +1 Vote", callback_data=f"gadj:{gid}:{uid}:1")],
-            [InlineKeyboardButton("➕ +5 Votes", callback_data=f"gadj:{gid}:{uid}:5")],
-            [InlineKeyboardButton("➕ +10 Votes", callback_data=f"gadj:{gid}:{uid}:10")],
-            [InlineKeyboardButton("➖ −1 Vote", callback_data=f"gadj:{gid}:{uid}:-1")],
-            [InlineKeyboardButton("➖ −5 Votes", callback_data=f"gadj:{gid}:{uid}:-5")],
-            [InlineKeyboardButton("🔢 Set Custom Votes", callback_data=f"gcust:{gid}:{uid}")],
-            [InlineKeyboardButton("🗑 Remove This Participant", callback_data=f"grm1:{gid}:{uid}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"gpanel:{gid}")]]))
+        reply_markup=participant_kb(gid, uid))
 
-# ---- Custom number votes ----
 @app.on_callback_query(filters.regex(r"^gcust:(.+):(\d+)$"))
 async def custom_votes(_, q: CallbackQuery):
     gid, uid = q.matches.group(1), q.matches.group(2)
@@ -365,7 +417,6 @@ async def custom_votes(_, q: CallbackQuery):
             InlineKeyboardButton("❌ Cancel", callback_data=f"gpanel:{gid}")]]))
     await q.answer()
 
-# ---- Add participant (manual) ----
 @app.on_callback_query(filters.regex(r"^gaddp:(.+)$"))
 async def add_participant(_, q: CallbackQuery):
     gid = q.matches.group(1)
@@ -382,7 +433,6 @@ async def add_participant(_, q: CallbackQuery):
             InlineKeyboardButton("❌ Cancel", callback_data=f"gpanel:{gid}")]]))
     await q.answer()
 
-# ---- Remove participant (selection list) ----
 @app.on_callback_query(filters.regex(r"^grmp:(.+)$"))
 async def remove_participant_list(_, q: CallbackQuery):
     gid = q.matches.group(1)
@@ -416,9 +466,10 @@ async def remove_one_participant(_, q: CallbackQuery):
     await q.answer(f"🗑 Removed {e['name']} and deleted their post.", show_alert=True)
     await open_panel(q.message.chat.id, gid, q.message.id)
 
-# ==================== TEXT INPUT ROUTER (custom votes / add participant) ====================
+# ==================== TEXT INPUT ROUTER ====================
 @app.on_message(filters.private & filters.text &
-                ~filters.command(["start", "manage", "stats", "end"]))
+                ~filters.command(["start", "manage", "stats", "end", "panel", "addadmin",
+                                  "maintenance", "gban", "gunban"]))
 async def text_router(_, m: Message):
     state = user_states.get(m.from_user.id)
     if not state:
@@ -470,21 +521,287 @@ async def text_router(_, m: Message):
             pass
         await m.reply_text(f"✅ **Added participant {name} with a vote box in the channel!**")
 
+    elif state == "OWN_ADD_SUDO":
+        user_states.pop(m.from_user.id, None)
+        try:
+            target = int(m.text.strip())
+        except ValueError:
+            return await m.reply_text("❌ **Send a numeric User ID only!**")
+        if target == OWNER_ID:
+            return await m.reply_text("⚠️ **The owner already has full powers.**")
+        SUDO_USERS.add(target)
+        await sudo_col.update_one({"user_id": target}, {"$set": {"user_id": target}}, upsert=True)
+        await m.reply_text(f"✅ **Admin added!**\n👤 **User ID:** `{target}`",
+                           reply_markup=owner_panel_kb())
+
+    elif state == "OWN_BAN_REASON":
+        target = temp_data.pop(m.from_user.id, {}).get("ban_target")
+        user_states.pop(m.from_user.id, None)
+        if target is None:
+            return await m.reply_text("❌ **Session expired.**")
+        await ban_user(target, m.text.strip() or "No reason provided")
+        await m.reply_text(
+            f"🚫 **User banned globally!**\n\n👤 **User ID:** `{target}`\n"
+            f"📝 **Reason:** {m.text.strip() or 'No reason provided'}",
+            reply_markup=owner_panel_kb())
+
+    elif state == "OWN_MAINT_REASON":
+        user_states.pop(m.from_user.id, None)
+        MAINTENANCE["reason"] = m.text.strip()
+        await settings_col.update_one(
+            {"key": "maintenance"},
+            {"$set": {"is_active": MAINTENANCE["active"], "reason": MAINTENANCE["reason"]}},
+            upsert=True)
+        await m.reply_text("✅ **Maintenance message updated!**",
+                           reply_markup=owner_panel_kb())
+
+# ==================== OWNER ADMIN PANEL ====================
+def owner_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Manage Sudo Admins", callback_data="own_sudo")],
+        [InlineKeyboardButton("🚫 Global Ban", callback_data="own_ban"),
+         InlineKeyboardButton("🟢 Global Unban", callback_data="own_unban")],
+        [InlineKeyboardButton("🛠️ Maintenance Mode", callback_data="own_maint")],
+        [InlineKeyboardButton("📊 Bot Statistics", callback_data="own_stats")],
+        [InlineKeyboardButton("✖️ Close Panel", callback_data="own_close")]])
+
+def owner_panel_text():
+    return (f"⚙️ **OWNER ADMIN PANEL**\n\n"
+            f"👑 **Owner ID:** `{OWNER_ID}`\n"
+            f"👥 **Sudo Admins:** {len(SUDO_USERS) - 1}\n"
+            f"🚫 **Banned Users:** {len(BANNED_USERS)}\n"
+            f"🛠️ **Maintenance:** {'🔴 ON' if MAINTENANCE['active'] else '🟢 OFF'}")
+
+@app.on_message(filters.command("panel") & filters.private)
+async def panel_cmd(_, m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.reply_text("⛔ **This command is restricted to the bot owner.**")
+    await m.reply_text(owner_panel_text(), reply_markup=owner_panel_kb())
+
+@app.on_callback_query(filters.regex("^owner_panel$"))
+async def owner_panel_cb(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("⛔ Owner only!", show_alert=True)
+    await q.message.edit_text(owner_panel_text(), reply_markup=owner_panel_kb())
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_close$"))
+async def own_close(_, q: CallbackQuery):
+    await q.message.delete()
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_sudo$"))
+async def own_sudo(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("⛔ Owner only!", show_alert=True)
+    kb = [[InlineKeyboardButton("➕ Add Sudo Admin", callback_data="own_sudo_add")]]
+    for uid in SUDO_USERS:
+        if uid == OWNER_ID:
+            continue
+        kb.append([InlineKeyboardButton(f"🗑 Remove {uid}", callback_data=f"own_sudo_rm:{uid}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="owner_panel")])
+    await q.message.edit_text(
+        f"👥 **MANAGE SUDO ADMINS**\n\n"
+        f"Sudo admins can use the bot during maintenance and are not affected by it.\n"
+        f"ℹ️ _Giveaway control is always limited to each giveaway's creator._",
+        reply_markup=InlineKeyboardMarkup(kb))
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_sudo_add$"))
+async def own_sudo_add(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return
+    user_states[q.from_user.id] = "OWN_ADD_SUDO"
+    await q.message.edit_text(
+        "➕ **ADD SUDO ADMIN**\n\nSend the **User ID** of the new admin:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="own_sudo")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex(r"^own_sudo_rm:(\d+)$"))
+async def own_sudo_rm(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return
+    uid = int(q.matches.group(1))
+    SUDO_USERS.discard(uid)
+    await sudo_col.delete_one({"user_id": uid})
+    await q.answer(f"🗑 Admin {uid} removed!", show_alert=True)
+    kb = [[InlineKeyboardButton("➕ Add Sudo Admin", callback_data="own_sudo_add")]]
+    for s in SUDO_USERS:
+        if s == OWNER_ID:
+            continue
+        kb.append([InlineKeyboardButton(f"🗑 Remove {s}", callback_data=f"own_sudo_rm:{s}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="owner_panel")])
+    await q.message.edit_text("👥 **MANAGE SUDO ADMINS**",
+                              reply_markup=InlineKeyboardMarkup(kb))
+
+@app.on_callback_query(filters.regex("^own_ban$"))
+async def own_ban(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("⛔ Owner only!", show_alert=True)
+    user_states[q.from_user.id] = "OWN_BAN_ID"
+    await q.message.edit_text(
+        "🚫 **GLOBAL BAN**\n\nSend the **User ID** to ban from the entire bot:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="owner_panel")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_unban$"))
+async def own_unban(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("⛔ Owner only!", show_alert=True)
+    user_states[q.from_user.id] = "OWN_UNBAN_ID"
+    await q.message.edit_text(
+        "🟢 **GLOBAL UNBAN**\n\nSend the **User ID** to unban:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="owner_panel")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_maint$"))
+async def own_maint(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("⛔ Owner only!", show_alert=True)
+    state = "🔴 ON" if MAINTENANCE["active"] else "🟢 OFF"
+    toggle = "🟢 Turn OFF Maintenance" if MAINTENANCE["active"] else "🔴 Turn ON Maintenance"
+    await q.message.edit_text(
+        f"🛠️ **MAINTENANCE MODE**\n\n"
+        f"📊 **Current status:** {state}\n"
+        f"📝 **Message:** {MAINTENANCE['reason']}\n\n"
+        f"ℹ️ _When ON, only the owner and sudo admins can use the bot._",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle, callback_data="own_maint_toggle")],
+            [InlineKeyboardButton("✏️ Change Maintenance Message", callback_data="own_maint_msg")],
+            [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_maint_toggle$"))
+async def own_maint_toggle(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return
+    MAINTENANCE["active"] = not MAINTENANCE["active"]
+    await settings_col.update_one(
+        {"key": "maintenance"},
+        {"$set": {"is_active": MAINTENANCE["active"], "reason": MAINTENANCE["reason"]}},
+        upsert=True)
+    state = "🔴 ON" if MAINTENANCE["active"] else "🟢 OFF"
+    toggle = "🟢 Turn OFF Maintenance" if MAINTENANCE["active"] else "🔴 Turn ON Maintenance"
+    await q.answer(f"✅ Maintenance is now {state}!", show_alert=True)
+    await q.message.edit_text(
+        f"🛠️ **MAINTENANCE MODE**\n\n"
+        f"📊 **Current status:** {state}\n"
+        f"📝 **Message:** {MAINTENANCE['reason']}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle, callback_data="own_maint_toggle")],
+            [InlineKeyboardButton("✏️ Change Maintenance Message", callback_data="own_maint_msg")],
+            [InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
+
+@app.on_callback_query(filters.regex("^own_maint_msg$"))
+async def own_maint_msg(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return
+    user_states[q.from_user.id] = "OWN_MAINT_REASON"
+    await q.message.edit_text(
+        "✏️ **CHANGE MAINTENANCE MESSAGE**\n\nSend the new message users will see "
+        "during maintenance:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="own_maint")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex("^own_stats$"))
+async def own_stats(_, q: CallbackQuery):
+    if q.from_user.id != OWNER_ID:
+        return await q.answer("⛔ Owner only!", show_alert=True)
+    total_gw = await giveaways.count_documents({})
+    active_gw = await giveaways.count_documents({"status": "active"})
+    total_parts = await entries.count_documents({})
+    total_votes = await votes.count_documents({})
+    await q.message.edit_text(
+        f"📊 **BOT STATISTICS**\n\n"
+        f"🎁 **Total giveaways:** {total_gw} (Active: {active_gw})\n"
+        f"👥 **Total participants:** {total_parts}\n"
+        f"🗳️ **Total votes:** {total_votes}\n"
+        f"👤 **Total known users:** {await users_col.count_documents({})}\n"
+        f"🚫 **Banned users:** {len(BANNED_USERS)}\n"
+        f"👥 **Sudo admins:** {len(SUDO_USERS) - 1}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
+    await q.answer()
+
+# ==================== OWNER TEXT COMMANDS (ban/unban) ====================
+@app.on_message(filters.command("gban") & filters.private)
+async def gban_cmd(_, m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.reply_text("⛔ **Owner only command.**")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        return await m.reply_text("Format: `/gban <user_id> [reason]`")
+    target = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else "No reason provided"
+    await ban_user(target, reason)
+    await m.reply_text(f"🚫 **User `{target}` banned globally.**\n📝 **Reason:** {reason}")
+
+@app.on_message(filters.command("gunban") & filters.private)
+async def gunban_cmd(_, m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.reply_text("⛔ **Owner only command.**")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        return await m.reply_text("Format: `/gunban <user_id>`")
+    await unban_user(int(parts[1]))
+    await m.reply_text(f"🟢 **User `{parts[1]}` unbanned globally.**")
+
+# ==================== BAN/UNBAN ID INPUT STATES ====================
+@app.on_message(filters.private & filters.text & filters.command([]) is None if False else filters.private)
+async def catch_ids(_, m: Message):
+    """Handles OWN_BAN_ID / OWN_UNBAN_ID states for numeric input."""
+    state = user_states.get(m.from_user.id)
+    if state not in ("OWN_BAN_ID", "OWN_UNBAN_ID"):
+        return
+    if not m.text.lstrip("-").isdigit():
+        return await m.reply_text("❌ **Send a numeric User ID only!**")
+    target = int(m.text.strip())
+    if state == "OWN_UNBAN_ID":
+        user_states.pop(m.from_user.id, None)
+        await unban_user(target)
+        return await m.reply_text(f"🟢 **User `{target}` unbanned globally!**",
+                                  reply_markup=owner_panel_kb())
+    if target == OWNER_ID:
+        user_states.pop(m.from_user.id, None)
+        return await m.reply_text("⚠️ **You cannot ban yourself (owner)!**")
+    user_states[m.from_user.id] = "OWN_BAN_REASON"
+    temp_data[m.from_user.id] = {"ban_target": target}
+    await m.reply_text(f"👤 **Target User ID:** `{target}`\n\n📝 **Send the ban reason:**")
+
 # ==================== LEAVE DETECTION (auto vote removal) ====================
-@app.on_raw_chat_member()
-async def on_chat_member(_, raw):
-    old_s = raw.old_chat_member.status if raw.old_chat_member else None
-    new_s = raw.new_chat_member.status if raw.new_chat_member else None
-    was_in = old_s in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
-                       ChatMemberStatus.OWNER)
-    now_out = new_s in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+def _raw_status(status):
+    if status is None:
+        return ChatMemberStatus.LEFT
+    if isinstance(status, RawStatus.Creator):
+        return ChatMemberStatus.OWNER
+    if isinstance(status, RawStatus.Admin):
+        return ChatMemberStatus.ADMINISTRATOR
+    if isinstance(status, RawStatus.Banned):
+        return ChatMemberStatus.BANNED
+    return ChatMemberStatus.LEFT
+
+IN_CHAT = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+OUT_CHAT = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
+
+@app.on_raw_update()
+async def on_raw_member_update(client, update, users, chats):
+    if not isinstance(update, UpdateChatMember):
+        return
+    old_s = _raw_status(update.old_chat_member.status if getattr(update, "old_chat_member", None) else None)
+    new_s = _raw_status(update.new_chat_member.status if getattr(update, "new_chat_member", None) else None)
+    was_in = old_s in IN_CHAT
+    now_out = new_s in OUT_CHAT
     if not (was_in and now_out):
         return
-    user_id = raw.new_chat_member.user.id
-    async for g in giveaways.find({"channel_id": raw.chat.id}):
+    user_id = update.from_id
+    chat_id = int("-100" + str(update.chat_id)) if update.chat_id < 0 else update.chat_id
+    async for g in giveaways.find({"channel_id": chat_id}):
         gid = str(g["_id"])
-        removed = await votes.find({"giveaway_id": gid,
-                                    "voter_id": user_id}).to_list(None)
+        removed = await votes.find({"giveaway_id": gid, "voter_id": user_id}).to_list(None)
         for rv in removed:
             await entries.find_one_and_update(
                 {"giveaway_id": gid, "user_id": rv["entry_user"]},
@@ -501,6 +818,9 @@ async def on_chat_member(_, raw):
 # ==================== END / STATS ====================
 @app.on_message(filters.command("end") & filters.private)
 async def end_cmd(_, m: Message):
+    block = await gate(m.from_user.id)
+    if block:
+        return await m.reply_text(block)
     g = await get_active_gw(m.from_user.id)
     if not g:
         return await m.reply_text("⛔ **No active giveaway for you.** Only the creator "
@@ -520,6 +840,9 @@ async def end_cmd(_, m: Message):
 
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(_, m: Message):
+    block = await gate(m.from_user.id)
+    if block:
+        return await m.reply_text(block)
     g = await get_active_gw(m.from_user.id)
     if not g:
         return await m.reply_text("⛔ **No active giveaway for you.**")
@@ -536,6 +859,7 @@ async def stats_cmd(_, m: Message):
 
 # ==================== RUN ====================
 async def main():
+    await init_db()
     await app.start()
     print("🚀 Giveaway Bot Started!")
     await idle()
