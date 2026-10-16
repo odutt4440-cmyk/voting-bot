@@ -890,4 +890,6 @@ async def main():
     await idle()
     await app.stop()
 
-app.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
