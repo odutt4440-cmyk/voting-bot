@@ -207,7 +207,8 @@ async def cancel_gw(_, q: CallbackQuery):
     else:
         await q.answer("Nothing to cancel.", show_alert=True)
 
-@app.on_message(filters.private & filters.regex(r"^(?:@|https?://t\.me/)\w{4,}$"))
+# ==================== CHANNEL LINK (group=1 — FIX) ====================
+@app.on_message(filters.private & filters.regex(r"^(?:@|https?://t\.me/)\w{4,}$"), group=1)
 async def set_channel(_, m: Message):
     g = await giveaways.find_one({"creator_id": m.from_user.id,
                                   "status": "waiting_channel"})
@@ -239,9 +240,10 @@ async def set_channel(_, m: Message):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel Setup", callback_data="gw_cancel")]]))
 
+# ==================== POST CAPTURE (group=1 — FIX) ====================
 @app.on_message(filters.private & (filters.photo | filters.text) &
-                ~filters.command(["start", "manage", "stats", "end", "cancel_gw",
-                                  "panel", "gban", "gunban"]))
+                ~filters.command(["start", "manage", "stats", "end", "panel",
+                                  "gban", "gunban"]), group=1)
 async def post_capture(_, m: Message):
     """Capture the creator's giveaway post and publish it to the channel."""
     state = user_states.get(m.from_user.id)
@@ -375,7 +377,7 @@ async def vote_cb(_, q: CallbackQuery):
         await refresh_vote_button(gid, entry_uid)
         await q.answer(f"✅ Vote counted! {res['name']} now has {res['votes']} votes.")
 
-# ==================== LEAVE DETECTION (FIXED — built-in handler) ====================
+# ==================== LEAVE DETECTION ====================
 IN_CHAT = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
 
 async def process_leave(chat_id: int, user_id: int):
@@ -383,7 +385,6 @@ async def process_leave(chat_id: int, user_id: int):
     async for g in giveaways.find({"channel_id": chat_id,
                                    "status": {"$in": ["active", "ended"]}}):
         gid = str(g["_id"])
-        # 1) hatao is bande ke diye saare votes (kisi bhi participant se)
         removed = await votes.find({"giveaway_id": gid,
                                     "voter_id": user_id}).to_list(None)
         affected = set()
@@ -393,10 +394,8 @@ async def process_leave(chat_id: int, user_id: int):
                 {"giveaway_id": gid, "user_id": rv["entry_user"]},
                 {"$inc": {"votes": -1}})
         await votes.delete_many({"giveaway_id": gid, "voter_id": user_id})
-        # buttons update karo jo bhi participants affected hai
         for uid_ in affected:
             await refresh_vote_button(gid, uid_)
-        # 2) agar khud ka participant leave kar gaya — entry + post delete
         e = await entries.find_one_and_delete({"giveaway_id": gid, "user_id": user_id})
         if e and e.get("message_id"):
             try:
@@ -414,7 +413,7 @@ async def on_member_change(_, update: ChatMemberUpdated):
         if not (was_in and now_out):
             return
         user = update.new_chat_member.user
-        if not user or user.is_self:   # bot khud leave hua ho toh kuch nahi
+        if not user or user.is_self:
             return
         await process_leave(update.chat.id, user.id)
     except Exception as e:
@@ -532,7 +531,7 @@ async def custom_votes(_, q: CallbackQuery):
     await q.message.edit_text(
         "🔢 **SET CUSTOM VOTES**\n\n"
         "Send the exact number of votes for this participant\n"
-        "(example: `25` or `100`):",
+        "(example: `25` or `100`, max `1000000`):",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel", callback_data=f"gpanel:{gid}")]]))
     await q.answer()
@@ -586,7 +585,7 @@ async def remove_one_participant(_, q: CallbackQuery):
     await q.answer(f"🗑 Removed {e['name']} and deleted their post.", show_alert=True)
     await open_panel(q.message.chat.id, gid, q.message.id)
 
-# ==================== END / CANCEL GIVEAWAY (buttons + command) ====================
+# ==================== END / CANCEL GIVEAWAY ====================
 async def do_end_giveaway(gid: str):
     g = await giveaways.find_one({"_id": ObjectId(gid)})
     if not g:
@@ -674,14 +673,12 @@ async def cancel_execute(_, q: CallbackQuery):
     g = await giveaways.find_one({"_id": ObjectId(gid)})
     if not g:
         return await q.answer("Giveaway not found.", show_alert=True)
-    # delete all participant vote boxes
     async for e in entries.find({"giveaway_id": gid}):
         if e.get("message_id"):
             try:
                 await app.delete_messages(e["chat_id"], e["message_id"])
             except Exception:
                 pass
-    # delete the giveaway post itself
     if g.get("post_message_id"):
         try:
             await app.delete_messages(g["channel_id"], g["post_message_id"])
@@ -694,7 +691,7 @@ async def cancel_execute(_, q: CallbackQuery):
                               "You can create a new one anytime with /start.")
     await q.answer("Deleted ✅", show_alert=True)
 
-# ==================== TEXT INPUT ROUTER ====================
+# ==================== TEXT INPUT ROUTER (group 0 — YAHAN SAB STATES HANDLE HONGE) ====================
 @app.on_message(filters.private & filters.text &
                 ~filters.command(["start", "manage", "stats", "end", "panel",
                                   "gban", "gunban"]))
@@ -709,10 +706,11 @@ async def text_router(_, m: Message):
         gid, uid = d.get("gid"), d.get("uid")
         try:
             val = int(m.text.strip())
-            if val < 0:
+            if val < 0 or val > 1_000_000:
                 raise ValueError
         except ValueError:
-            return await m.reply_text("❌ **Send a valid positive number only!**")
+            return await m.reply_text(
+                "❌ **Send a valid number between 0 and 1,000,000!**")
         if not await authorize(m.from_user.id, gid):
             return await m.reply_text("⛔ **Not authorized.**")
         e = await entries.find_one_and_update(
@@ -720,7 +718,7 @@ async def text_router(_, m: Message):
             {"$set": {"votes": val}})
         if e:
             await refresh_vote_button(gid, uid)
-            await m.reply_text(f"✅ **Votes set to {val} for {e['name']}!**")
+            await m.reply_text(f"✅ **Votes set to {val:,} for {e['name']}!**")
         else:
             await m.reply_text("❌ Participant not found.")
 
@@ -745,7 +743,7 @@ async def text_router(_, m: Message):
                                "Make sure the bot is an Admin there.")
 
     elif state == "GW_WAITING_POST":
-        return  # handled by post_capture above
+        return  # handled by post_capture (group=1) above
 
     elif state == "OWN_ADD_SUDO":
         user_states.pop(m.from_user.id, None)
