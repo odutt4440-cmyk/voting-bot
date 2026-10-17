@@ -5,7 +5,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters, idle
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton as _BaseIBtn, CallbackQuery, Message
+from pyrogram.types import (InlineKeyboardMarkup,
+                            InlineKeyboardButton as _BaseIBtn,
+                            CallbackQuery, Message, ChatMemberUpdated)
 from pyrogram.enums import ButtonStyle, ChatMemberStatus
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
@@ -25,7 +27,7 @@ asyncio.set_event_loop(loop)
 def InlineKeyboardButton(text, style=None, **kwargs):
     if style is None:
         danger = ("❌", "🚫", "🗑", "delete", "terminate", "reject", "ban", "close",
-                  "remove", "cancel", "stop", "finish", "deduct", "−")
+                  "remove", "cancel", "stop", "finish", "deduct", "−", "end")
         success = ("✅", "🟢", "✨", "approve", "confirm", "verify", "add", "claim",
                    "join", "check", "participate", "vote", "+")
         t = text.lower()
@@ -138,7 +140,6 @@ async def start_handler(_, m: Message):
     block = await gate(m.from_user.id)
     if block:
         return await m.reply_text(block)
-    # save user for stats
     await users_col.update_one(
         {"user_id": m.from_user.id},
         {"$set": {"user_id": m.from_user.id, "name": m.from_user.first_name}}, upsert=True)
@@ -165,7 +166,8 @@ async def help_cb(_, q: CallbackQuery):
         "6️⃣ Users tap Participate — they must JOIN the channel first\n"
         "7️⃣ Each participant gets an automatic vote box with a colored vote button\n"
         "8️⃣ Voting also requires channel membership\n"
-        "9️⃣ Use /manage for the control panel, /stats for results, /end to finish",
+        "9️⃣ /manage = control panel (End / Cancel buttons included), "
+        "/stats = results",
         show_alert=True)
 
 # ==================== CREATE GIVEAWAY ====================
@@ -175,9 +177,11 @@ async def create_gw(_, q: CallbackQuery):
     if block:
         return await q.answer(block, show_alert=True)
     active = await giveaways.find_one(
-        {"creator_id": q.from_user.id, "status": {"$in": ["waiting_channel", "waiting_post", "active"]}})
+        {"creator_id": q.from_user.id,
+         "status": {"$in": ["waiting_channel", "waiting_post", "active"]}})
     if active:
-        return await q.answer("You already have an active giveaway. Use /end first.",
+        return await q.answer("You already have an active giveaway. "
+                              "Use /manage to End or Cancel it first.",
                               show_alert=True)
     await giveaways.insert_one({
         "creator_id": q.from_user.id, "creator_name": q.from_user.first_name,
@@ -194,7 +198,8 @@ async def create_gw(_, q: CallbackQuery):
 @app.on_callback_query(filters.regex("^gw_cancel$"))
 async def cancel_gw(_, q: CallbackQuery):
     res = await giveaways.delete_one(
-        {"creator_id": q.from_user.id, "status": {"$in": ["waiting_channel", "waiting_post"]}})
+        {"creator_id": q.from_user.id,
+         "status": {"$in": ["waiting_channel", "waiting_post"]}})
     if res.deleted_count:
         user_states.pop(q.from_user.id, None)
         await q.message.edit_text("❌ **Setup cancelled.** You can start again anytime.")
@@ -235,8 +240,8 @@ async def set_channel(_, m: Message):
             InlineKeyboardButton("❌ Cancel Setup", callback_data="gw_cancel")]]))
 
 @app.on_message(filters.private & (filters.photo | filters.text) &
-                ~filters.command(["start", "manage", "stats", "end", "panel",
-                                  "gban", "gunban"]))
+                ~filters.command(["start", "manage", "stats", "end", "cancel_gw",
+                                  "panel", "gban", "gunban"]))
 async def post_capture(_, m: Message):
     """Capture the creator's giveaway post and publish it to the channel."""
     state = user_states.get(m.from_user.id)
@@ -257,7 +262,6 @@ async def post_capture(_, m: Message):
                              url=f"https://t.me/{bot_username}?start={gid}",
                              style=ButtonStyle.SUCCESS)]])
 
-    # Post exactly what the creator sent — text or photo with caption
     try:
         if m.photo:
             published = await app.send_photo(
@@ -272,14 +276,15 @@ async def post_capture(_, m: Message):
             "Make sure the bot is an **Admin** there, then send the post again.")
 
     await giveaways.update_one(
-        {"_id": g["_id"]}, {"$set": {"status": "active", "post_message_id": published.id}})
+        {"_id": g["_id"]},
+        {"$set": {"status": "active", "post_message_id": published.id}})
     user_states.pop(m.from_user.id, None)
     temp_data.pop(m.from_user.id, None)
     await m.reply_text(
         "🎉 **GIVEAWAY IS LIVE!**\n\n"
         f"📢 **Channel:** @{g['channel_username']}\n"
         "✅ Your post has been published with a Participate button.\n\n"
-        f"⚙️ /manage — control panel\n"
+        f"⚙️ /manage — control panel (End / Cancel buttons inside)\n"
         f"📊 /stats — live results\n"
         f"🏁 /end — finish and announce the winner")
 
@@ -349,7 +354,6 @@ async def check_join(_, q: CallbackQuery):
 # ==================== PUBLIC VOTING ====================
 @app.on_callback_query(filters.regex(r"^gvote:(.+):(\d+)$"))
 async def vote_cb(_, q: CallbackQuery):
-    # ✅ FIX: kurigram q.matches is a LIST — use q.matches[0].group(...)
     match = q.matches[0]
     gid, entry_uid = match.group(1), int(match.group(2))
     g = await giveaways.find_one({"_id": ObjectId(gid)})
@@ -371,11 +375,59 @@ async def vote_cb(_, q: CallbackQuery):
         await refresh_vote_button(gid, entry_uid)
         await q.answer(f"✅ Vote counted! {res['name']} now has {res['votes']} votes.")
 
+# ==================== LEAVE DETECTION (FIXED — built-in handler) ====================
+IN_CHAT = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+
+async def process_leave(chat_id: int, user_id: int):
+    """Remove all votes cast by this user + delete their own entry & post."""
+    async for g in giveaways.find({"channel_id": chat_id,
+                                   "status": {"$in": ["active", "ended"]}}):
+        gid = str(g["_id"])
+        # 1) hatao is bande ke diye saare votes (kisi bhi participant se)
+        removed = await votes.find({"giveaway_id": gid,
+                                    "voter_id": user_id}).to_list(None)
+        affected = set()
+        for rv in removed:
+            affected.add(rv["entry_user"])
+            await entries.find_one_and_update(
+                {"giveaway_id": gid, "user_id": rv["entry_user"]},
+                {"$inc": {"votes": -1}})
+        await votes.delete_many({"giveaway_id": gid, "voter_id": user_id})
+        # buttons update karo jo bhi participants affected hai
+        for uid_ in affected:
+            await refresh_vote_button(gid, uid_)
+        # 2) agar khud ka participant leave kar gaya — entry + post delete
+        e = await entries.find_one_and_delete({"giveaway_id": gid, "user_id": user_id})
+        if e and e.get("message_id"):
+            try:
+                await app.delete_messages(e["chat_id"], e["message_id"])
+            except Exception:
+                pass
+
+@app.on_chat_member_updated()
+async def on_member_change(_, update: ChatMemberUpdated):
+    try:
+        old_s = update.old_chat_member.status if update.old_chat_member else ChatMemberStatus.LEFT
+        new_s = update.new_chat_member.status if update.new_chat_member else ChatMemberStatus.LEFT
+        was_in = old_s in IN_CHAT
+        now_out = new_s in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        if not (was_in and now_out):
+            return
+        user = update.new_chat_member.user
+        if not user or user.is_self:   # bot khud leave hua ho toh kuch nahi
+            return
+        await process_leave(update.chat.id, user.id)
+    except Exception as e:
+        print(f"[leave-detect error] {e}")
+
 # ==================== CREATOR CONTROL PANEL ====================
 async def get_active_gw(user_id: int):
     if user_id == OWNER_ID:
-        return await giveaways.find_one({"status": "active"})
-    return await giveaways.find_one({"creator_id": user_id, "status": "active"})
+        return await giveaways.find_one(
+            {"status": {"$in": ["active", "waiting_channel", "waiting_post"]}})
+    return await giveaways.find_one(
+        {"creator_id": user_id,
+         "status": {"$in": ["active", "waiting_channel", "waiting_post"]}})
 
 async def open_panel(chat_id: int, gid: str, msg_id: int = None):
     rows = await entries.find({"giveaway_id": gid}).sort("votes", -1).to_list(40)
@@ -385,12 +437,14 @@ async def open_panel(chat_id: int, gid: str, msg_id: int = None):
     kb.append([
         InlineKeyboardButton("➕ Add Participant", callback_data=f"gaddp:{gid}"),
         InlineKeyboardButton("➖ Remove Participant", callback_data=f"grmp:{gid}")])
+    kb.append([
+        InlineKeyboardButton("🏁 End Giveaway", callback_data=f"gend:{gid}"),
+        InlineKeyboardButton("❌ Cancel Giveaway", callback_data=f"gcnl:{gid}")])
     kb.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"gpanel:{gid}")])
     kb.append([InlineKeyboardButton("❌ Close Panel", callback_data="gclose")])
     text = (f"⚙️ **CREATOR CONTROL PANEL**\n\n"
             f"👥 **Total participants:** {len(rows)}\n\n"
-            "Select a participant to manage votes, "
-            "or use the buttons below:")
+            "Select a participant to manage votes, or use the buttons below:")
     markup = InlineKeyboardMarkup(kb)
     if msg_id:
         try:
@@ -532,6 +586,114 @@ async def remove_one_participant(_, q: CallbackQuery):
     await q.answer(f"🗑 Removed {e['name']} and deleted their post.", show_alert=True)
     await open_panel(q.message.chat.id, gid, q.message.id)
 
+# ==================== END / CANCEL GIVEAWAY (buttons + command) ====================
+async def do_end_giveaway(gid: str):
+    g = await giveaways.find_one({"_id": ObjectId(gid)})
+    if not g:
+        return None
+    await giveaways.update_one({"_id": g["_id"]}, {"$set": {"status": "ended"}})
+    top = await entries.find({"giveaway_id": gid}).sort("votes", -1).limit(5).to_list(5)
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    text = "🏁 **GIVEAWAY ENDED — FINAL RESULTS**\n\n"
+    body = "\n".join(f"{medals[i]} {r['name']} — **{r['votes']}** votes"
+                     for i, r in enumerate(top))
+    text += body or "No participants."
+    try:
+        await app.send_message(g["channel_id"], text)
+    except Exception:
+        pass
+    return g, text
+
+@app.on_message(filters.command("end") & filters.private)
+async def end_cmd(_, m: Message):
+    block = await gate(m.from_user.id)
+    if block:
+        return await m.reply_text(block)
+    g = await get_active_gw(m.from_user.id)
+    if not g or g["status"] != "active":
+        return await m.reply_text("⛔ **No active giveaway for you.** Only the creator "
+                                  "or the bot owner can end it.")
+    gid = str(g["_id"])
+    if not await authorize(m.from_user.id, gid):
+        return await m.reply_text("⛔ **Not authorized.**")
+    result = await do_end_giveaway(gid)
+    await m.reply_text(result[1])
+
+@app.on_callback_query(filters.regex(r"^gend:(.+)$"))
+async def end_confirm(_, q: CallbackQuery):
+    gid = q.matches[0].group(1)
+    if not await authorize(q.from_user.id, gid):
+        return await q.answer("⛔ Not authorized!", show_alert=True)
+    await q.message.edit_text(
+        "🏁 **END GIVEAWAY?**\n\n"
+        "This will finish the giveaway and announce the final results in the channel.\n"
+        "⚠️ This cannot be undone!",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, End It",
+                                  callback_data=f"gendc:{gid}"),
+             InlineKeyboardButton("🔙 No, Go Back",
+                                  callback_data=f"gpanel:{gid}")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex(r"^gendc:(.+)$"))
+async def end_execute(_, q: CallbackQuery):
+    gid = q.matches[0].group(1)
+    if not await authorize(q.from_user.id, gid):
+        return await q.answer("⛔ Not authorized!", show_alert=True)
+    result = await do_end_giveaway(gid)
+    if not result:
+        return await q.answer("Giveaway not found.", show_alert=True)
+    await q.message.edit_text(result[1] +
+                              "\n\n✅ **Giveaway has been ended successfully!**")
+    await q.answer("🏁 Giveaway ended!", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^gcnl:(.+)$"))
+async def cancel_confirm(_, q: CallbackQuery):
+    gid = q.matches[0].group(1)
+    if not await authorize(q.from_user.id, gid):
+        return await q.answer("⛔ Not authorized!", show_alert=True)
+    await q.message.edit_text(
+        "❌ **CANCEL / DELETE GIVEAWAY?**\n\n"
+        "This will:\n"
+        "• Delete the giveaway post from the channel\n"
+        "• Delete all participant vote boxes\n"
+        "• Delete all entries and votes\n\n"
+        "⚠️ This cannot be undone!",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Yes, Delete Everything",
+                                  callback_data=f"gcnlc:{gid}"),
+             InlineKeyboardButton("🔙 No, Go Back",
+                                  callback_data=f"gpanel:{gid}")]]))
+    await q.answer()
+
+@app.on_callback_query(filters.regex(r"^gcnlc:(.+)$"))
+async def cancel_execute(_, q: CallbackQuery):
+    gid = q.matches[0].group(1)
+    if not await authorize(q.from_user.id, gid):
+        return await q.answer("⛔ Not authorized!", show_alert=True)
+    g = await giveaways.find_one({"_id": ObjectId(gid)})
+    if not g:
+        return await q.answer("Giveaway not found.", show_alert=True)
+    # delete all participant vote boxes
+    async for e in entries.find({"giveaway_id": gid}):
+        if e.get("message_id"):
+            try:
+                await app.delete_messages(e["chat_id"], e["message_id"])
+            except Exception:
+                pass
+    # delete the giveaway post itself
+    if g.get("post_message_id"):
+        try:
+            await app.delete_messages(g["channel_id"], g["post_message_id"])
+        except Exception:
+            pass
+    await votes.delete_many({"giveaway_id": gid})
+    await entries.delete_many({"giveaway_id": gid})
+    await giveaways.delete_one({"_id": g["_id"]})
+    await q.message.edit_text("🗑 **Giveaway deleted completely.** "
+                              "You can create a new one anytime with /start.")
+    await q.answer("Deleted ✅", show_alert=True)
+
 # ==================== TEXT INPUT ROUTER ====================
 @app.on_message(filters.private & filters.text &
                 ~filters.command(["start", "manage", "stats", "end", "panel",
@@ -583,8 +745,7 @@ async def text_router(_, m: Message):
                                "Make sure the bot is an Admin there.")
 
     elif state == "GW_WAITING_POST":
-        # Ignore here — handled by post_capture (photo/text handlers above).
-        return
+        return  # handled by post_capture above
 
     elif state == "OWN_ADD_SUDO":
         user_states.pop(m.from_user.id, None)
@@ -849,86 +1010,7 @@ async def gunban_cmd(_, m: Message):
     await unban_user(int(parts[1]))
     await m.reply_text(f"🟢 **User `{parts[1]}` unbanned globally.**")
 
-# ==================== LEAVE DETECTION ====================
-IN_CHAT = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
-OUT_CHAT = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
-
-def _raw_status_name(status_obj):
-    if status_obj is None:
-        return ChatMemberStatus.LEFT
-    name = type(status_obj).__name__
-    if name == "ChatMemberStatusCreator":
-        return ChatMemberStatus.OWNER
-    if name == "ChatMemberStatusAdmin":
-        return ChatMemberStatus.ADMINISTRATOR
-    if name == "ChatMemberStatusBanned":
-        return ChatMemberStatus.BANNED
-    if name == "ChatMemberStatusRight":
-        return ChatMemberStatus.MEMBER
-    return ChatMemberStatus.LEFT
-
-@app.on_raw_update()
-async def on_raw_member_update(client, update, users, chats):
-    if type(update).__name__ != "UpdateChatMember":
-        return
-    old_member = getattr(update, "old_chat_member", None)
-    new_member = getattr(update, "new_chat_member", None)
-    old_s = _raw_status_name(old_member.status if old_member else None)
-    new_s = _raw_status_name(new_member.status if new_member else None)
-    if not (old_s in IN_CHAT and new_s in OUT_CHAT):
-        return
-
-    user_id = getattr(update, "from_id", None)
-    if user_id is None and new_member and getattr(new_member, "user", None):
-        user_id = new_member.user.id
-    if user_id is None:
-        return
-
-    raw_cid = getattr(update, "chat_id", None)
-    if raw_cid is None:
-        return
-    chat_id = int("-100" + str(abs(raw_cid))) if raw_cid < 0 else raw_cid
-
-    async for g in giveaways.find({"channel_id": chat_id}):
-        gid = str(g["_id"])
-        removed = await votes.find({"giveaway_id": gid,
-                                    "voter_id": user_id}).to_list(None)
-        for rv in removed:
-            await entries.find_one_and_update(
-                {"giveaway_id": gid, "user_id": rv["entry_user"]},
-                {"$inc": {"votes": -1}})
-            await refresh_vote_button(gid, rv["entry_user"])
-        await votes.delete_many({"giveaway_id": gid, "voter_id": user_id})
-        e = await entries.find_one_and_delete({"giveaway_id": gid, "user_id": user_id})
-        if e and e.get("message_id"):
-            try:
-                await app.delete_messages(e["chat_id"], e["message_id"])
-            except Exception:
-                pass
-
-# ==================== END / STATS ====================
-@app.on_message(filters.command("end") & filters.private)
-async def end_cmd(_, m: Message):
-    block = await gate(m.from_user.id)
-    if block:
-        return await m.reply_text(block)
-    g = await get_active_gw(m.from_user.id)
-    if not g:
-        return await m.reply_text("⛔ **No active giveaway for you.** Only the creator "
-                                  "or the bot owner can end it.")
-    gid = str(g["_id"])
-    await giveaways.update_one({"_id": g["_id"]}, {"$set": {"status": "ended"}})
-    top = await entries.find({"giveaway_id": gid}).sort("votes", -1).limit(5).to_list(5)
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    text = "🏁 **GIVEAWAY ENDED — FINAL RESULTS**\n\n"
-    text += "\n".join(f"{medals[i]} {r['name']} — **{r['votes']}** votes"
-                      for i, r in enumerate(top)) or "No participants."
-    await m.reply_text(text)
-    try:
-        await app.send_message(g["channel_id"], text)
-    except Exception:
-        pass
-
+# ==================== STATS ====================
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(_, m: Message):
     block = await gate(m.from_user.id)
