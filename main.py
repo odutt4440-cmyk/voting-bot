@@ -108,6 +108,10 @@ async def is_member(user_id: int, channel_id: int) -> bool:
     except Exception:
         return False
 
+def disp(row: dict) -> str:
+    """Participant display: Name [ID: 123456] — copy-proof identification."""
+    return f"{row.get('name', 'Participant')} [ID: `{row.get('user_id', '?')}`]"
+
 def vote_button(v: int, gid: str, uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(f"🗳 VOTE — {v}", callback_data=f"gvote:{gid}:{uid}",
@@ -295,8 +299,10 @@ async def create_entry(g: dict, uid: int, name: str, gid: str):
     await entries.insert_one({"giveaway_id": gid, "user_id": uid,
                               "name": name, "votes": 0})
     try:
+        # Vote box me naam + User ID dono dikhte hain (copy-proof)
         post = await app.send_message(
-            g["channel_id"], f"**{name}**",
+            g["channel_id"],
+            f"👤 **{name}**\n🆔 **User ID:** `{uid}`",
             reply_markup=vote_button(0, gid, uid))
         await entries.update_one(
             {"giveaway_id": gid, "user_id": uid},
@@ -375,7 +381,7 @@ async def vote_cb(_, q: CallbackQuery):
         {"$inc": {"votes": 1}}, return_document=True)
     if res:
         await refresh_vote_button(gid, entry_uid)
-        await q.answer(f"✅ Vote counted! {res['name']} now has {res['votes']} votes.")
+        await q.answer(f"✅ Vote counted! {disp(res)} now has {res['votes']} votes.")
 
 # ==================== LEAVE DETECTION ====================
 IN_CHAT = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
@@ -397,6 +403,17 @@ async def process_leave(chat_id: int, user_id: int):
         for uid_ in affected:
             await refresh_vote_button(gid, uid_)
         e = await entries.find_one_and_delete({"giveaway_id": gid, "user_id": user_id})
+        if e:
+            # Owner ko detailed report — naam + ID
+            try:
+                await app.send_message(
+                    OWNER_ID,
+                    f"🚪 **Participant left the channel — entry & votes removed!**\n\n"
+                    f"👤 {disp(e)}\n"
+                    f"🎁 **Giveaway:** `{gid}`\n"
+                    f"🗑️ **Their vote box deleted from channel.**")
+            except Exception:
+                pass
         if e and e.get("message_id"):
             try:
                 await app.delete_messages(e["chat_id"], e["message_id"])
@@ -431,7 +448,7 @@ async def get_active_gw(user_id: int):
 async def open_panel(chat_id: int, gid: str, msg_id: int = None):
     rows = await entries.find({"giveaway_id": gid}).sort("votes", -1).to_list(40)
     kb = [[InlineKeyboardButton(
-        f"👤 {r['name']} — {r['votes']} votes",
+        f"👤 {r['name']} [ID: `{r['user_id']}`] — {r['votes']} 🗳",
         callback_data=f"gp:{gid}:{r['user_id']}")] for r in rows]
     kb.append([
         InlineKeyboardButton("➕ Add Participant", callback_data=f"gaddp:{gid}"),
@@ -491,7 +508,7 @@ async def panel_user(_, q: CallbackQuery):
     if not e:
         return await q.answer("Participant not found.", show_alert=True)
     await q.message.edit_text(
-        f"👤 **{e['name']}**\n🗳️ **Current votes:** {e['votes']}\n\nSelect an action:",
+        f"👤 {disp(e)}\n🗳️ **Current votes:** {e['votes']}\n\nSelect an action:",
         reply_markup=participant_kb(gid, uid))
     await q.answer()
 
@@ -513,10 +530,10 @@ async def adjust_votes(_, q: CallbackQuery):
     await entries.update_one({"giveaway_id": gid, "user_id": uid},
                              {"$set": {"votes": new_v}})
     await refresh_vote_button(gid, uid)
-    await q.answer(f"✅ Done! {e['name']} now has {new_v} votes.", show_alert=True)
+    await q.answer(f"✅ Done! {disp(e)} now has {new_v} votes.", show_alert=True)
     try:
         await q.message.edit_text(
-            f"👤 **{e['name']}**\n🗳️ **Current votes:** {new_v}\n\nSelect an action:",
+            f"👤 {disp(e)}\n🗳️ **Current votes:** {new_v}\n\nSelect an action:",
             reply_markup=participant_kb(gid, uid))
     except Exception:
         pass
@@ -561,7 +578,7 @@ async def remove_participant_list(_, q: CallbackQuery):
     if not rows:
         return await q.answer("No participants to remove.", show_alert=True)
     kb = [[InlineKeyboardButton(
-        f"🗑 {r['name']} — {r['votes']} votes",
+        f"🗑 {r['name']} [ID: `{r['user_id']}`] — {r['votes']} 🗳",
         callback_data=f"grm1:{gid}:{r['user_id']}")] for r in rows]
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"gpanel:{gid}")])
     await q.message.edit_text("➖ **SELECT PARTICIPANT TO REMOVE:**",
@@ -582,7 +599,7 @@ async def remove_one_participant(_, q: CallbackQuery):
             await app.delete_messages(e["chat_id"], e["message_id"])
         except Exception:
             pass
-    await q.answer(f"🗑 Removed {e['name']} and deleted their post.", show_alert=True)
+    await q.answer(f"🗑 Removed {disp(e)} and deleted their post.", show_alert=True)
     await open_panel(q.message.chat.id, gid, q.message.id)
 
 # ==================== END / CANCEL GIVEAWAY ====================
@@ -594,7 +611,7 @@ async def do_end_giveaway(gid: str):
     top = await entries.find({"giveaway_id": gid}).sort("votes", -1).limit(5).to_list(5)
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     text = "🏁 **GIVEAWAY ENDED — FINAL RESULTS**\n\n"
-    body = "\n".join(f"{medals[i]} {r['name']} — **{r['votes']}** votes"
+    body = "\n".join(f"{medals[i]} {disp(r)} — **{r['votes']}** votes"
                      for i, r in enumerate(top))
     text += body or "No participants."
     try:
@@ -718,7 +735,7 @@ async def text_router(_, m: Message):
             {"$set": {"votes": val}})
         if e:
             await refresh_vote_button(gid, uid)
-            await m.reply_text(f"✅ **Votes set to {val:,} for {e['name']}!**")
+            await m.reply_text(f"✅ **Votes set to {val:,} for {disp(e)}!**")
         else:
             await m.reply_text("❌ Participant not found.")
 
@@ -737,7 +754,7 @@ async def text_router(_, m: Message):
         g = await giveaways.find_one({"_id": ObjectId(gid)})
         if await create_entry(g, uid, name, gid):
             await m.reply_text(
-                f"✅ **Added participant {name} with a vote box in the channel!**")
+                f"✅ **Added participant {name} (`{uid}`) with a vote box in the channel!**")
         else:
             await m.reply_text("⚠️ **Bot cannot post in the channel.** "
                                "Make sure the bot is an Admin there.")
@@ -1025,7 +1042,7 @@ async def stats_cmd(_, m: Message):
             f"🗳️ **Total votes:** {tv}\n\n**Top 10:**\n")
     medals = ["🥇", "🥈", "🥉"]
     for i, r in enumerate(top):
-        text += f"{medals[i] if i < 3 else f'{i+1}.'} {r['name']} — **{r['votes']}**\n"
+        text += f"{medals[i] if i < 3 else f'{i+1}.'} {disp(r)} — **{r['votes']}**\n"
     await m.reply_text(text)
 
 # ==================== RUN ====================
