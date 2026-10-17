@@ -30,17 +30,13 @@ def InlineKeyboardButton(text, style=None, **kwargs):
             ButtonStyle.SUCCESS if any(k in t for k in success) else ButtonStyle.PRIMARY)
     return _BaseIBtn(text, style=style, **kwargs)
 
-# ==================== DATABASE ====================
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo["giveaway_bot"]
-giveaways = db["giveaways"]
-entries = db["entries"]
-votes = db["votes"]
-sudo_col = db["sudo_users"]
-users_col = db["users"]
-settings_col = db["settings"]
+# ==================== DATABASE (created inside event loop — NO module-level client) ====================
+mongo = None
+db = giveaways = entries = votes = None
+sudo_col = users_col = settings_col = None
 
-app = Client("GiveawayBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# NOTE: Client bhi main() ke andar banega (loop-safe)
+app = None
 
 user_states = {}
 temp_data = {}
@@ -51,12 +47,9 @@ BANNED_USERS = {}
 MAINTENANCE = {"active": False,
                "reason": "Bot is under maintenance. Please try again later."}
 
-# ==================== DATABASE ====================
-db = giveaways = entries = votes = None
-sudo_col = users_col = settings_col = None
-
 async def init_db():
-    global db, giveaways, entries, votes, sudo_col, users_col, settings_col
+    global mongo, db, giveaways, entries, votes, sudo_col, users_col, settings_col
+    global SUDO_USERS, MAINTENANCE
     mongo = AsyncIOMotorClient(MONGO_URI)
     db = mongo["giveaway_bot"]
     giveaways = db["giveaways"]
@@ -66,7 +59,6 @@ async def init_db():
     users_col = db["users"]
     settings_col = db["settings"]
 
-    global SUDO_USERS, MAINTENANCE
     await sudo_col.update_one({"user_id": OWNER_ID}, {"$set": {"user_id": OWNER_ID}}, upsert=True)
     docs = await sudo_col.find().to_list(1000)
     SUDO_USERS = {d["user_id"] for d in docs}
@@ -896,8 +888,15 @@ async def stats_cmd(_, m: Message):
         text += f"{medals[i] if i < 3 else f'{i+1}.'} {r['name']} — **{r['votes']}**\n"
     await m.reply_text(text)
 
-# ==================== RUN ====================
+# ==================== RUN (everything created INSIDE the event loop) ====================
 async def main():
+    global app
+    if not BOT_TOKEN or not API_ID or not API_HASH:
+        raise SystemExit("❌ Missing BOT_TOKEN / API_ID / API_HASH in environment variables!")
+    if OWNER_ID == 0:
+        raise SystemExit("❌ Missing OWNER_ID in environment variables!")
+
+    app = Client("GiveawayBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     await init_db()
     await app.start()
     print("🚀 Giveaway Bot Started!")
